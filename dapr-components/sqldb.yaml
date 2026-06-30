@@ -1,0 +1,10 @@
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: sqldb
+spec:
+  type: bindings.postgresql
+  version: v1
+  metadata:
+  - name: connectionString
+    value: "host=postgres port=5432 user=postgres password=P@ssw0rd1234 dbname=ticketdb sslmode=disable"

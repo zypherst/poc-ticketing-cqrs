@@ -1,0 +1,12 @@
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: seat-state-nats
+spec:
+  type: state.jetstream
+  version: v1
+  metadata:
+  - name: natsURL
+    value: "nats://nats:4222"
+  - name: bucket
+    value: "seatKV"

@@ -1,0 +1,133 @@
+services:
+  # ==============================================================
+  # 1. PostgreSQL (Database ต้นทาง - กลับมาเป็น v17 แล้วครับ!)
+  # ==============================================================
+  postgres:
+    image: postgres:17-alpine
+    container_name: poc_postgres_cqrs
+    environment:
+      POSTGRES_DB: ticketdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: P@ssw0rd1234
+    command: ["postgres", "-c", "wal_level=logical"]
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db-init:/docker-entrypoint-initdb.d 
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ticketdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ==============================================================
+  # 2. NATS & NATS-Setup (Message Broker)
+  # ==============================================================
+  nats:
+    image: nats:latest
+    container_name: poc_nats_cqrs
+    command: ["-js"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+
+  nats-setup:
+    image: natsio/nats-box:latest
+    container_name: poc_nats_setup_cqrs
+    depends_on:
+      - nats
+    command: >
+      sh -c "echo 'NATS setup completed'"
+
+  # ==============================================================
+  # 3. Sequin Stack (Redis -> Sequin -> Setup)
+  # ==============================================================
+  sequin-redis:
+    image: redis:7-alpine
+    container_name: poc_sequin_redis_cqrs
+    ports:
+      - "6379:6379"
+
+  sequin:
+    image: sequin/sequin:latest
+    container_name: poc_sequin_cqrs
+    ports:
+      - "7376:7376"
+    environment:
+      - PORT=7376
+      - PG_HOSTNAME=postgres
+      - PG_PORT=5432
+      - PG_DATABASE=ticketdb
+      - PG_USERNAME=postgres
+      - PG_PASSWORD=P@ssw0rd1234
+      - SECRET_KEY_BASE=super_secret_key_base_for_local_ticketing_cqrs_poc_1234567890_abcdef
+      - VAULT_KEY=pGOv8qX+L8yQ3j5Vz7rK2b4m9H1nW6xY/C0eA+FvJtE=
+      - REDIS_URL=redis://sequin-redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      sequin-redis:
+        condition: service_started
+
+  # ==============================================================
+  # 4. Backend & Backend-Dapr (.NET 8 API)
+  # ==============================================================
+  backend:
+    build: 
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: poc_backend
+    ports:
+      - "5000:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_HTTP_PORTS=8080
+      - DAPR_HTTP_PORT=3500     # <-- เพิ่มบรรทัดนี้: บอก .NET ว่า Dapr HTTP อยู่พอร์ตไหน
+      - DAPR_GRPC_PORT=50001    # <-- เพิ่มบรรทัดนี้: บอก .NET ว่า Dapr gRPC อยู่พอร์ตไหน
+      - DAPR_HTTP_ENDPOINT=http://127.0.0.1:3500
+      - DAPR_GRPC_ENDPOINT=http://127.0.0.1:50001
+      - TZ=Asia/Bangkok
+    depends_on:
+      - postgres
+      - nats
+
+  # ---------------- Dapr Sidecar for Backend ----------------
+  backend-dapr:
+    image: daprio/daprd:latest
+    container_name: poc_backend_dapr
+    command: [
+      "./daprd",
+      "-app-id", "api-service",
+      "-app-port", "8080",
+      "-dapr-http-port", "3500",  # <-- เพิ่มบรรทัดนี้: บังคับให้ Dapr เปิดพอร์ต HTTP ที่ 3500
+      "-dapr-grpc-port", "50001", # <-- เพิ่มบรรทัดนี้: บังคับให้ Dapr เปิดพอร์ต gRPC ที่ 50001
+      "-components-path", "/components"
+    ]
+    volumes:
+      - ./dapr-components:/components
+    network_mode: "service:backend"
+    depends_on:
+      backend:
+        condition: service_started
+      nats-setup:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+
+
+  # ==============================================================
+  # 5. Frontend
+  # ==============================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: poc_frontend
+    ports:
+      - "3000:80" # Assuming Nginx/Vite serves on 80 in container
+    environment:
+      - VITE_API_URL=http://localhost:5000
+
+#Define Storage
+volumes:
+  nats_data:
