@@ -13,6 +13,6 @@ spec:
   - name: durableSubscriptionName
     value: "projection-worker-sub"
   - name: deliverNew
-    value: "true"
+    value: "false"
   - name: contentType
     value: "application/json"

@@ -14,6 +14,7 @@ services:
       - "5432:5432"
     volumes:
       - ./db-init:/docker-entrypoint-initdb.d
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d ticketdb"]
       interval: 5s
@@ -30,6 +31,8 @@ services:
     ports:
       - "4222:4222"
       - "8222:8222"
+    volumes:
+      - nats_data:/data
     healthcheck:
       test: ["CMD", "nats-server", "--version"]
       interval: 5s
@@ -49,7 +52,7 @@ services:
         echo 'Creating KV Bucket...' &&
         nats kv add seatKV --server nats://nats:4222 || echo '⚠️  KV Bucket already exists' &&
         echo 'Creating Stream...' &&
-        nats stream add SEAT_STREAM --subjects 'seat.events' --storage memory --discard old --replicas 1 --defaults --server nats://nats:4222 || echo '⚠️  Stream already exists' &&
+        nats stream add SEAT_STREAM --subjects 'seat.events' --discard old --replicas 1 --defaults --server nats://nats:4222 || echo '⚠️  Stream already exists' &&
         echo '✅ NATS Setup Completed!'
       "
 
@@ -189,3 +192,4 @@ services:
 
 volumes:
   nats_data:
+  postgres_data:

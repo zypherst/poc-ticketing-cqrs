@@ -135,57 +135,68 @@ public async Task<IActionResult> GetSeatPlan(int showtimeId)
             apiResponse.Data = plan;
             apiResponse.Logs.Add(new ActionLog { Message = "✅ ดึงข้อมูลสำเร็จจาก PostgreSQL" });
 
-		try
-            {
-                // 🛠️ บังคับให้การเซฟลง NATS มีเวลาแค่ 1 วินาที ถ้าไม่เสร็จให้โยน Error ทันที
-                using var saveCts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
-                
-                await _daprClient.SaveStateAsync(NatsStateStore, cacheKey, plan, cancellationToken: saveCts.Token);
-                apiResponse.Logs.Add(new ActionLog { Message = "🔄 ซิงค์ข้อมูลกลับไปบันทึกที่ NATS KV เรียบร้อย" });
-                _isNatsStale = false; 
-            }
-            catch (Exception)
-            {
-                apiResponse.Logs.Add(new ActionLog { Message = "⚠️ ไม่สามารถซิงค์ Cache ได้เนื่องจาก NATS ขัดข้อง (Degraded Mode)" });
-                _isNatsStale = true;
-            }
-
             return Ok(apiResponse);
         }
 
         // 4. อัปเดตสถานะ (แก้การดึงข้อมูลเพื่อซิงค์กลับ NATS ให้รองรับ Array of Arrays)
-        [HttpPost("seats/update-status")]
-public async Task<IActionResult> UpdateSeatStatus([FromBody] UpdateSeatsRequest req)
+[HttpPost("seats/update-status")]
+        public async Task<IActionResult> UpdateSeatStatus([FromBody] UpdateSeatsRequest req)
         {
             var apiResponse = new ApiResponse<string> { Data = "Success" };
 
-            // 🛠️ 1. สร้างคำสั่ง SQL ที่บันทึกทั้งตาราง seats และ outbox_events ใน Transaction เดียวกัน
-            var sqlStatements = new List<string>();
-            sqlStatements.Add("BEGIN;");
-            
+            // 1. กำหนดเงื่อนไขว่า "ก่อนจะเปลี่ยน สถานะเดิมต้องเป็นอะไร" (ป้องกันคนอื่นแย่งทำไปแล้ว)
+            string expectedStatus = ""; 
+            if (req.Status == "Lock") expectedStatus = ""; // จะล็อคได้ สถานะเดิมต้อง "ว่าง"
+            else if (req.Status == "Paid") expectedStatus = "Lock"; // จะจ่ายเงินได้ สถานะเดิมต้อง "Lock" อยู่
+            else if (req.Status == "") expectedStatus = "Lock"; // จะปลดล็อคได้ สถานะเดิมต้อง "Lock" อยู่
+
             string statusValue = req.Status == "Paid" ? "Paid" : req.Status;
             string paymentTimeStr = req.Status == "Paid" ? "NOW()" : "NULL";
             
             string seatCodesCsv = string.Join(",", req.SeatCodes.Select(c => $"'{c}'"));
-            sqlStatements.Add($"UPDATE seats SET status = '{statusValue}', payment_time = {paymentTimeStr} WHERE showtime_id = {req.ShowtimeId} AND seat_code IN ({seatCodesCsv});");
+            int seatCount = req.SeatCodes.Count;
 
-            // 🛠️ 2. วนลูปสร้าง Event ลงตาราง outbox_events (ให้ Sequin ดูดไป)
+            // 2. ใช้ DO Block เพื่อทำ Transaction และตรวจสอบ Concurrency
+            var sqlStatements = new List<string>
+            {
+                "DO $$",
+                "DECLARE updated_count INT;",
+                "BEGIN",
+                // พยายามอัปเดต โดยเพิ่มเงื่อนไข AND status = 'expectedStatus' เข้าไปด้วย
+                $"  UPDATE seats SET status = '{statusValue}', payment_time = {paymentTimeStr} WHERE showtime_id = {req.ShowtimeId} AND seat_code IN ({seatCodesCsv}) AND status = '{expectedStatus}';",
+                // ดึงจำนวนรายการที่สามารถอัปเดตได้จริงๆ
+                "  GET DIAGNOSTICS updated_count = ROW_COUNT;",
+                // ถ้าอัปเดตได้น้อยกว่าที่ขอ แปลว่ามีเก้าอี้บางตัวเปลี่ยนสถานะไปแล้ว (มีคนแย่งจอง)
+                $"  IF updated_count <> {seatCount} THEN",
+                "    RAISE EXCEPTION 'CONCURRENCY_CONFLICT';", // โยน Error เพื่อหยุดและ Rollback การทำงานทั้งหมด
+                "  END IF;"
+            };
+
+            // 3. วนลูปสร้าง Event ลงตาราง outbox_events (ถ้าโค้ดรันมาถึงตรงนี้แปลว่าปลอดภัย 100%)
             foreach(var code in req.SeatCodes)
             {
                 string payloadJson = $"{{\"showtime_id\": {req.ShowtimeId}, \"seat_code\": \"{code}\", \"status\": \"{statusValue}\"}}";
-                sqlStatements.Add($"INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload) VALUES ('Seat', '{req.ShowtimeId}-{code}', 'SeatUpdated', '{payloadJson}');");
+                sqlStatements.Add($"  INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload) VALUES ('Seat', '{req.ShowtimeId}-{code}', 'SeatUpdated', '{payloadJson}');");
             }
             
-            sqlStatements.Add("COMMIT;");
+            sqlStatements.Add("END $$;");
             
-            var sqlQuery = string.Join("\n", sqlStatements);
-            var metadata = new Dictionary<string, string> { { "sql", sqlQuery } };
-            
-            // ยิงคำสั่งเข้า PostgreSQL รอบเดียวจบ (และไม่ต้องไปยุ่งกับ NATS ตรงนี้เลย)
-            await _daprClient.InvokeBindingAsync(SqlBinding, "exec", "", metadata);
-            apiResponse.Logs.Add(new ActionLog { Message = "💾 บันทึกที่นั่งและ Outbox Event ลง PostgreSQL สำเร็จ (ตัดการบันทึก NATS โดยตรงออก)" });
+            var metadata = new Dictionary<string, string> { { "sql", string.Join("\n", sqlStatements) } };
 
-            return Ok(apiResponse);
+            try
+            {
+                // ส่งคำสั่งไปประมวลผลที่ PostgreSQL รอบเดียวจบ
+                await _daprClient.InvokeBindingAsync(SqlBinding, "exec", "", metadata);
+                apiResponse.Logs.Add(new ActionLog { Message = $"💾 บันทึกสถานะ '{req.Status}' สำเร็จ (ไม่พบการชนกัน)" });
+                return Ok(apiResponse);
+            }
+            catch (Exception)
+            {
+                // ถ้า PostgreSQL โยน Exception 'CONCURRENCY_CONFLICT' ออกมา จะเข้าบล็อกนี้
+                apiResponse.Data = "Failed";
+                apiResponse.Logs.Add(new ActionLog { Message = $"❌ ถูกปฏิเสธ (Race Condition)! ที่นั่งนี้ถูกทำรายการไปก่อนหน้าคุณเสี้ยววินาที" });
+                return BadRequest(apiResponse); // รีเทิร์น 400 Bad Request
+            }
         }
 
     }

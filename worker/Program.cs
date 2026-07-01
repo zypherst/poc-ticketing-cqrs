@@ -24,6 +24,11 @@ app.MapPost("/process-seat-event",
 
         var body = JsonDocument.Parse(rawBody).RootElement;
 
+	if (body.TryGetProperty("data", out var dataEl))
+	{
+    		body = dataEl; // ทะลวงเข้าไปในชั้น data
+	}
+
         // Sequin wraps the outbox row under "record":
         // { "record": { ... }, "action": "insert", "metadata": { ... } }
         JsonElement record;
@@ -53,8 +58,31 @@ app.MapPost("/process-seat-event",
         var seatPlan = await daprClient.GetStateAsync<SeatPlanDto>("seat-state-nats", cacheKey);
         if (seatPlan == null || seatPlan.Seats == null)
         {
-            logger.LogWarning("⚠️ [Worker] Cache miss for Showtime {ShowtimeId}", showtimeId);
-            return Results.Ok();
+            logger.LogWarning("⚠️ [Worker] Cache miss for Showtime {ShowtimeId}. กำลัง Rebuild ข้อมูลจาก Database...", showtimeId);
+
+            var selectMetadata = new Dictionary<string, string> { 
+                { "sql", $"SELECT seat_code, status, payment_time FROM seats WHERE showtime_id = {showtimeId} ORDER BY seat_code" } 
+            };
+            var rawData = await daprClient.InvokeBindingAsync<string, JsonElement>("sqldb", "query", "", selectMetadata);
+            
+            var dbSeats = new List<Seat>();
+            foreach (var row in rawData.EnumerateArray())
+            {
+                dbSeats.Add(new Seat {
+                    SeatCode = row[0].GetString(),
+                    Status = row[1].GetString(),
+                    PaymentTime = row[2].ValueKind == JsonValueKind.Null ? null : row[2].GetDateTime()
+                });
+            }
+
+            seatPlan = new SeatPlanDto { ShowtimeId = showtimeId, Seats = dbSeats };
+            
+            // เซฟทับลงไปใน NATS เลย
+            await daprClient.SaveStateAsync("seat-state-nats", cacheKey, seatPlan);
+            logger.LogInformation("✅ [Worker] Rebuild ผังที่นั่งรอบฉาย {ShowtimeId} ลง NATS สำเร็จ (Self-Healing)!", showtimeId);
+            
+            // 리เทิร์นได้เลย เพราะข้อมูลที่ดึงมาใหม่สุดจาก DB มันรวมการจองครั้งนี้ไปเรียบร้อยแล้ว
+            return Results.Ok(); 
         }
 
         var seat = seatPlan.Seats.FirstOrDefault(s => s.SeatCode == seatCode);

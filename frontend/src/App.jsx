@@ -75,7 +75,7 @@ export default function App() {
     }
   };
 
-  // Requirement 7: กดไปหน้าจ่ายเงิน (เปลี่ยนสถานะเก้าอี้เป็น Lock ทั้งคู่)
+// Requirement 7: กดไปหน้าจ่ายเงิน (เปลี่ยนสถานะเก้าอี้เป็น Lock ทั้งคู่)
   const proceedToPayment = async () => {
     if (selectedSeats.length === 0) {
       alert("กรุณาเลือกที่นั่งก่อนครับ!");
@@ -83,19 +83,36 @@ export default function App() {
     }
 
     pushLog(`⏳ กำลังทำการ Lock ที่นั่งจำนวน ${selectedSeats.length} ที่นั่ง...`);
-    const res = await fetch(`${API_URL}/seats/update-status`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        showtimeId: selectedShowtime.id,
-        seatCodes: selectedSeats,
-        status: 'Lock'
-      })
-    });
-    const result = await res.json();
-    result.logs.forEach(l => pushLog(l.message, l.timestamp));
     
-    setView('payment');
+    try {
+      const res = await fetch(`${API_URL}/seats/update-status`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          showtimeId: selectedShowtime.id,
+          seatCodes: selectedSeats,
+          status: 'Lock'
+        })
+      });
+
+      // 🛑 ตรวจสอบว่า Backend ตอบกลับมาเป็น 400 Bad Request หรือไม่ (แปลว่าแย่งกันจอง)
+      if (!res.ok) {
+        alert("ขออภัยครับ! ที่นั่งบางส่วนที่คุณเลือกเพิ่งถูกผู้อื่นทำรายการไปเมื่อสักครู่นี้ กรุณาเลือกที่นั่งใหม่ครับ");
+        pushLog(`❌ การจองล้มเหลว: ที่นั่งถูกแย่งจองไปแล้ว!`);
+        
+        // ล้างเก้าอี้ที่เลือกไว้ และโหลดผังที่นั่งใหม่ล่าสุดมาแสดง
+        setSelectedSeats([]);
+        fetchSeatPlan(selectedShowtime);
+        return; 
+      }
+
+      const result = await res.json();
+      result.logs.forEach(l => pushLog(l.message, l.timestamp));
+      
+      setView('payment');
+    } catch (err) {
+      pushLog(`❌ ขัดข้อง: ไม่สามารถติดต่อระบบได้`);
+    }
   };
 
   // Requirement 8: กดกลับจากหน้าจ่ายเงิน ปลดล๊อกในระบบ แต่ Frontend ยังติ๊กเก้าอี้ตัวเดิมไว้ให้
