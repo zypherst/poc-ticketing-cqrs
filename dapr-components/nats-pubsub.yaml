@@ -1,0 +1,18 @@
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: nats-pubsub
+spec:
+  type: pubsub.jetstream
+  version: v1
+  metadata:
+  - name: natsURL
+    value: "nats://nats:4222"
+  - name: name
+    value: "dapr-pubsub"
+  - name: durableSubscriptionName
+    value: "projection-worker-sub"
+  - name: deliverNew
+    value: "true"
+  - name: contentType
+    value: "application/json"

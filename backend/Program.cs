@@ -21,6 +21,8 @@ builder.Services.AddHostedService<NatsWarmupService>();
 var app = builder.Build();
 
 app.UseCors("AllowAll");
+//app.UseCloudEvents(); 
 app.MapControllers();
+//app.MapSubscribeHandler(); 
 
 app.Run();

@@ -43,4 +43,5 @@ namespace TicketBookingPoc.Models
         public T Data { get; set; }
         public List<ActionLog> Logs { get; set; } = new();
     }
+
 }

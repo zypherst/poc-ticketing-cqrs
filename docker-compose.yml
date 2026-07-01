@@ -1,6 +1,6 @@
 services:
   # ==============================================================
-  # 1. PostgreSQL (Database ต้นทาง - กลับมาเป็น v17 แล้วครับ!)
+  # 1. PostgreSQL
   # ==============================================================
   postgres:
     image: postgres:17-alpine
@@ -13,7 +13,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - ./db-init:/docker-entrypoint-initdb.d 
+      - ./db-init:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d ticketdb"]
       interval: 5s
@@ -30,23 +30,42 @@ services:
     ports:
       - "4222:4222"
       - "8222:8222"
+    healthcheck:
+      test: ["CMD", "nats-server", "--version"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   nats-setup:
     image: natsio/nats-box:latest
     container_name: poc_nats_setup_cqrs
     depends_on:
-      - nats
+      nats:
+        condition: service_healthy
     command: >
-      sh -c "echo 'NATS setup completed'"
+      sh -c "
+        echo 'Waiting for NATS...' &&
+        sleep 3 &&
+        echo 'Creating KV Bucket...' &&
+        nats kv add seatKV --server nats://nats:4222 || echo '⚠️  KV Bucket already exists' &&
+        echo 'Creating Stream...' &&
+        nats stream add SEAT_STREAM --subjects 'seat.events' --storage memory --discard old --replicas 1 --defaults --server nats://nats:4222 || echo '⚠️  Stream already exists' &&
+        echo '✅ NATS Setup Completed!'
+      "
 
   # ==============================================================
-  # 3. Sequin Stack (Redis -> Sequin -> Setup)
+  # 3. Sequin Stack
   # ==============================================================
   sequin-redis:
     image: redis:7-alpine
     container_name: poc_sequin_redis_cqrs
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   sequin:
     image: sequin/sequin:latest
@@ -67,13 +86,13 @@ services:
       postgres:
         condition: service_healthy
       sequin-redis:
-        condition: service_started
+        condition: service_healthy
 
   # ==============================================================
   # 4. Backend & Backend-Dapr (.NET 8 API)
   # ==============================================================
   backend:
-    build: 
+    build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: poc_backend
@@ -82,16 +101,17 @@ services:
     environment:
       - ASPNETCORE_ENVIRONMENT=Development
       - ASPNETCORE_HTTP_PORTS=8080
-      - DAPR_HTTP_PORT=3500     # <-- เพิ่มบรรทัดนี้: บอก .NET ว่า Dapr HTTP อยู่พอร์ตไหน
-      - DAPR_GRPC_PORT=50001    # <-- เพิ่มบรรทัดนี้: บอก .NET ว่า Dapr gRPC อยู่พอร์ตไหน
+      - DAPR_HTTP_PORT=3500
+      - DAPR_GRPC_PORT=50001
       - DAPR_HTTP_ENDPOINT=http://127.0.0.1:3500
       - DAPR_GRPC_ENDPOINT=http://127.0.0.1:50001
       - TZ=Asia/Bangkok
     depends_on:
-      - postgres
-      - nats
+      postgres:
+        condition: service_healthy
+      nats-setup:
+        condition: service_completed_successfully
 
-  # ---------------- Dapr Sidecar for Backend ----------------
   backend-dapr:
     image: daprio/daprd:latest
     container_name: poc_backend_dapr
@@ -99,8 +119,8 @@ services:
       "./daprd",
       "-app-id", "api-service",
       "-app-port", "8080",
-      "-dapr-http-port", "3500",  # <-- เพิ่มบรรทัดนี้: บังคับให้ Dapr เปิดพอร์ต HTTP ที่ 3500
-      "-dapr-grpc-port", "50001", # <-- เพิ่มบรรทัดนี้: บังคับให้ Dapr เปิดพอร์ต gRPC ที่ 50001
+      "-dapr-http-port", "3500",
+      "-dapr-grpc-port", "50001",
       "-components-path", "/components"
     ]
     volumes:
@@ -114,7 +134,6 @@ services:
       postgres:
         condition: service_healthy
 
-
   # ==============================================================
   # 5. Frontend
   # ==============================================================
@@ -124,10 +143,49 @@ services:
       dockerfile: Dockerfile
     container_name: poc_frontend
     ports:
-      - "3000:80" # Assuming Nginx/Vite serves on 80 in container
+      - "3000:80"
     environment:
       - VITE_API_URL=http://localhost:5000
 
-#Define Storage
+  # ==============================================================
+  # 6. Projection Worker & Worker-Dapr (.NET 8)
+  # ==============================================================
+  projection-worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    container_name: poc_projection_worker
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_HTTP_PORTS=8080
+      - DAPR_HTTP_PORT=3501
+      - DAPR_GRPC_PORT=50002
+      - DAPR_HTTP_ENDPOINT=http://127.0.0.1:3501
+      - DAPR_GRPC_ENDPOINT=http://127.0.0.1:50002
+      - TZ=Asia/Bangkok
+    depends_on:
+      nats-setup:
+        condition: service_completed_successfully
+
+  worker-dapr:
+    image: daprio/daprd:latest
+    container_name: poc_worker_dapr
+    command: [
+      "./daprd",
+      "-app-id", "projection-worker",
+      "-app-port", "8080",
+      "-dapr-http-port", "3501",
+      "-dapr-grpc-port", "50002",
+      "-components-path", "/components"
+    ]
+    volumes:
+      - ./dapr-components:/components
+    network_mode: "service:projection-worker"
+    depends_on:
+      projection-worker:
+        condition: service_started
+      nats-setup:
+        condition: service_completed_successfully
+
 volumes:
   nats_data:

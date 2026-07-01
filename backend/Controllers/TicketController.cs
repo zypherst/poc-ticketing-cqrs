@@ -158,59 +158,35 @@ public async Task<IActionResult> GetSeatPlan(int showtimeId)
 public async Task<IActionResult> UpdateSeatStatus([FromBody] UpdateSeatsRequest req)
         {
             var apiResponse = new ApiResponse<string> { Data = "Success" };
-            var cacheKey = $"showtime-plan-{req.ShowtimeId}";
 
-            string sqlQuery;
-            if (req.Status == "Paid") {
-                sqlQuery = $"UPDATE seats SET status = 'Paid', payment_time = NOW() WHERE showtime_id = {req.ShowtimeId} AND seat_code IN ({string.Join(",", req.SeatCodes.Select(c => $"'{c}'"))})";
-                apiResponse.Logs.Add(new ActionLog { Message = $"💰 ทำรายการชำระเงินหลอกๆ บันทึกสถานะเป็น Paid" });
-            } else {
-                sqlQuery = $"UPDATE seats SET status = '{req.Status}', payment_time = NULL WHERE showtime_id = {req.ShowtimeId} AND seat_code IN ({string.Join(",", req.SeatCodes.Select(c => $"'{c}'"))})";
-                apiResponse.Logs.Add(new ActionLog { Message = $"🔄 เปลี่ยนสถานะเก้าอี้ใน Database เป็น '{req.Status}'" });
+            // 🛠️ 1. สร้างคำสั่ง SQL ที่บันทึกทั้งตาราง seats และ outbox_events ใน Transaction เดียวกัน
+            var sqlStatements = new List<string>();
+            sqlStatements.Add("BEGIN;");
+            
+            string statusValue = req.Status == "Paid" ? "Paid" : req.Status;
+            string paymentTimeStr = req.Status == "Paid" ? "NOW()" : "NULL";
+            
+            string seatCodesCsv = string.Join(",", req.SeatCodes.Select(c => $"'{c}'"));
+            sqlStatements.Add($"UPDATE seats SET status = '{statusValue}', payment_time = {paymentTimeStr} WHERE showtime_id = {req.ShowtimeId} AND seat_code IN ({seatCodesCsv});");
+
+            // 🛠️ 2. วนลูปสร้าง Event ลงตาราง outbox_events (ให้ Sequin ดูดไป)
+            foreach(var code in req.SeatCodes)
+            {
+                string payloadJson = $"{{\"showtime_id\": {req.ShowtimeId}, \"seat_code\": \"{code}\", \"status\": \"{statusValue}\"}}";
+                sqlStatements.Add($"INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload) VALUES ('Seat', '{req.ShowtimeId}-{code}', 'SeatUpdated', '{payloadJson}');");
             }
-
+            
+            sqlStatements.Add("COMMIT;");
+            
+            var sqlQuery = string.Join("\n", sqlStatements);
             var metadata = new Dictionary<string, string> { { "sql", sqlQuery } };
+            
+            // ยิงคำสั่งเข้า PostgreSQL รอบเดียวจบ (และไม่ต้องไปยุ่งกับ NATS ตรงนี้เลย)
             await _daprClient.InvokeBindingAsync(SqlBinding, "exec", "", metadata);
-            apiResponse.Logs.Add(new ActionLog { Message = "💾 บันทึกการเปลี่ยนสถานะลง PostgreSQL สำเร็จ" });
-
-            var selectMetadata = new Dictionary<string, string> { 
-                { "sql", $"SELECT seat_code, status, payment_time FROM seats WHERE showtime_id = {req.ShowtimeId} ORDER BY seat_code" } 
-            };
-            var rawData = await _daprClient.InvokeBindingAsync<string, JsonElement>(SqlBinding, "query", "", selectMetadata);
-            
-            var updatedDbSeats = new List<Seat>();
-            foreach (var row in rawData.EnumerateArray())
-            {
-                updatedDbSeats.Add(new Seat {
-                    SeatCode = row[0].GetString(),
-                    Status = row[1].GetString(),
-                    PaymentTime = row[2].ValueKind == JsonValueKind.Null ? null : row[2].GetDateTime()
-                });
-            }
-            
-            var updatedPlan = new SeatPlanDto { ShowtimeId = req.ShowtimeId, Seats = updatedDbSeats };
-
-            try
-            {
-		if (DateTime.Now < _natsCircuitOpenUntil) throw new Exception("Circuit is open");
-		// 🛠️ บังคับให้การเซฟสถานะใหม่ลง NATS มีเวลาแค่ 0.3 วินาที
-                using var saveCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
-                
-                await _daprClient.SaveStateAsync(NatsStateStore, cacheKey, updatedPlan, cancellationToken: saveCts.Token);
-                apiResponse.Logs.Add(new ActionLog { Message = "⚡ ซิงค์สถานะใหม่เข้า NATS KV สำเร็จ" });
-                _isNatsStale = false;
-            }
-            catch (Exception)
-            {
-                if (DateTime.Now >= _natsCircuitOpenUntil) 
-                {
-                    _natsCircuitOpenUntil = DateTime.Now.AddSeconds(10); // สับเบรกเกอร์
-                }
-                apiResponse.Logs.Add(new ActionLog { Message = "⚠️ ข้ามการซิงค์ NATS ชั่วคราว (Circuit Breaker/ระบบขัดข้อง)" });
-                _isNatsStale = true;
-            }
+            apiResponse.Logs.Add(new ActionLog { Message = "💾 บันทึกที่นั่งและ Outbox Event ลง PostgreSQL สำเร็จ (ตัดการบันทึก NATS โดยตรงออก)" });
 
             return Ok(apiResponse);
         }
+
     }
 }

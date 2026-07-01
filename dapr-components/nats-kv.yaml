@@ -10,3 +10,5 @@ spec:
     value: "nats://nats:4222"
   - name: bucket
     value: "seatKV"
+  - name: keyPrefix
+    value: "none"
