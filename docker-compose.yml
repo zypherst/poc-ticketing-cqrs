@@ -1,20 +1,26 @@
 services:
   # ==============================================================
-  # 1. PostgreSQL
+  # 1. PostgreSQL Master Node (รับทั้ง Read และ Write)
   # ==============================================================
-  postgres:
-    image: postgres:17-alpine
-    container_name: poc_postgres_cqrs
-    environment:
-      POSTGRES_DB: ticketdb
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: P@ssw0rd1234
-    command: ["postgres", "-c", "wal_level=logical"]
+  postgres-master:
+    image: bitnamilegacy/postgresql:17.6.0-debian-12-r4
+    container_name: poc_postgres_master
     ports:
-      - "5432:5432"
+      - "5432:5432" # เปิดพอร์ตไว้เผื่อเอาโปรแกรมข้างนอก (เช่น DBeaver) ต่อเข้าไปดู
+    environment:
+      - POSTGRESQL_POSTGRES_PASSWORD=postgres
+      - POSTGRESQL_USERNAME=postgres
+      - POSTGRESQL_PASSWORD=postgres
+      - POSTGRESQL_DATABASE=ticketdb
+      # ตั้งค่าเปิดใช้งาน Replication โหมด Master
+      - POSTGRESQL_REPLICATION_MODE=master
+      - POSTGRESQL_REPLICATION_USER=repl_user
+      - POSTGRESQL_REPLICATION_PASSWORD=repl_password
+      - POSTGRESQL_WAL_LEVEL=logical
     volumes:
+      # ใช้โฟลเดอร์ init.sql เดิมของคุณ เพื่อรันสร้าง Schema ตอนเปิดเครื่องครั้งแรก
       - ./db-init:/docker-entrypoint-initdb.d
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_master_data:/bitnami/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d ticketdb"]
       interval: 5s
@@ -22,48 +28,117 @@ services:
       retries: 5
 
   # ==============================================================
-  # 2. NATS & NATS-Setup (Message Broker)
+  # 2. PostgreSQL Replica Node 1 (รับเฉพาะ Read อย่างเดียว)
   # ==============================================================
-  nats:
-    image: nats:latest
-    container_name: poc_nats_cqrs
-    command: ["-js"]
-    ports:
-      - "4222:4222"
-      - "8222:8222"
+  postgres-replica-1:
+    image: bitnamilegacy/postgresql:17.6.0-debian-12-r4
+    container_name: poc_postgres_replica_1
+    environment:
+      - POSTGRESQL_POSTGRESQL_PASSWORD=postgres
+      - POSTGRESQL_PASSWORD=postgres
+      # ตั้งค่าเปิดใช้งาน Replication โหมด Slave (Replica)
+      - POSTGRESQL_REPLICATION_MODE=slave
+      - POSTGRESQL_MASTER_HOST=postgres-master
+      - POSTGRESQL_MASTER_PORT_NUMBER=5432
+      - POSTGRESQL_REPLICATION_USER=repl_user
+      - POSTGRESQL_REPLICATION_PASSWORD=repl_password
     volumes:
-      - nats_data:/data
-    healthcheck:
-      test: ["CMD", "nats-server", "--version"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  nats-setup:
-    image: natsio/nats-box:latest
-    container_name: poc_nats_setup_cqrs
+      - postgres_replica_1_data:/bitnami/postgresql
     depends_on:
-      nats:
+      postgres-master:
         condition: service_healthy
-    command: >
-      sh -c "
-        echo 'Waiting for NATS...' &&
-        sleep 3 &&
-        echo 'Creating KV Bucket...' &&
-        nats kv add seatKV --server nats://nats:4222 || echo '⚠️  KV Bucket already exists' &&
-        echo 'Creating Stream...' &&
-        nats stream add SEAT_STREAM --subjects 'seat.events' --discard old --replicas 1 --defaults --server nats://nats:4222 || echo '⚠️  Stream already exists' &&
-        echo '✅ NATS Setup Completed!'
-      "
 
   # ==============================================================
-  # 3. Sequin Stack
+  # 3. PostgreSQL Replica Node 2 (รับเฉพาะ Read อย่างเดียว)
+  # ==============================================================
+  postgres-replica-2:
+    image: bitnamilegacy/postgresql:17.6.0-debian-12-r4
+    container_name: poc_postgres_replica_2
+    environment:
+      - POSTGRESQL_POSTGRES_PASSWORD=postgres
+      - POSTGRESQL_PASSWORD=postgres
+      - POSTGRESQL_REPLICATION_MODE=slave
+      - POSTGRESQL_MASTER_HOST=postgres-master
+      - POSTGRESQL_MASTER_PORT_NUMBER=5432
+      - POSTGRESQL_REPLICATION_USER=repl_user
+      - POSTGRESQL_REPLICATION_PASSWORD=repl_password
+    volumes:
+      - postgres_replica_2_data:/bitnami/postgresql
+    depends_on:
+      postgres-master:
+        condition: service_healthy
+
+  # ==============================================================
+  # HAProxy TCP Load Balancer สำหรับด่านหน้า Database
+  # ==============================================================
+  haproxy-db:
+    image: haproxy:2.8-alpine
+    container_name: poc_haproxy_db
+    ports:
+      - "9999:9999"  # พอร์ตหลักที่ทุกคนจะวิ่งเข้าหา (ยกเว้น Sequin)
+      - "8405:8405"  # พอร์ตสำหรับดูหน้า Dashboard ของฝั่ง DB
+    volumes:
+      - ./haproxy-db.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - pgpool-1
+      - pgpool-2
+
+  # ==============================================================
+  # Pgpool-II เครื่องที่ 1
+  # ==============================================================
+  pgpool-1:
+    image: bitnamilegacy/pgpool:latest
+    container_name: poc_pgpool_1
+    environment:
+      - PGPOOL_BACKEND_NODES=0:postgres-master:5432,1:postgres-replica-1:5432,2:postgres-replica-2:5432
+      - PGPOOL_SR_CHECK_USER=postgres
+      - PGPOOL_SR_CHECK_PASSWORD=postgres
+      - PGPOOL_POSTGRES_USERNAME=postgres
+      - PGPOOL_POSTGRES_PASSWORD=postgres
+      - PGPOOL_ADMIN_USERNAME=pgpool
+      - PGPOOL_ADMIN_PASSWORD=pgpool
+      - PGPOOL_SR_CHECK_DATABASE=ticketdb
+      - PGPOOL_ENABLE_LOAD_BALANCE=yes
+      - PGPOOL_NUM_INIT_CHILDREN=32       
+      - PGPOOL_MAX_POOL=4                 
+    depends_on:
+      - postgres-master
+      - postgres-replica-1
+      - postgres-replica-2
+
+  # ==============================================================
+  # Pgpool-II เครื่องที่ 2
+  # ==============================================================
+  pgpool-2:
+    image: bitnamilegacy/pgpool:latest
+    container_name: poc_pgpool_2
+    environment:
+      - PGPOOL_BACKEND_NODES=0:postgres-master:5432,1:postgres-replica-1:5432,2:postgres-replica-2:5432
+      - PGPOOL_SR_CHECK_USER=postgres
+      - PGPOOL_SR_CHECK_PASSWORD=postgres
+      - PGPOOL_POSTGRES_USERNAME=postgres
+      - PGPOOL_POSTGRES_PASSWORD=postgres
+      - PGPOOL_ADMIN_USERNAME=pgpool
+      - PGPOOL_ADMIN_PASSWORD=pgpool
+      - PGPOOL_SR_CHECK_DATABASE=ticketdb
+      - PGPOOL_ENABLE_LOAD_BALANCE=yes
+      - PGPOOL_NUM_INIT_CHILDREN=32
+      - PGPOOL_MAX_POOL=4
+    depends_on:
+      - postgres-master
+      - postgres-replica-1
+      - postgres-replica-2
+
+  # ==============================================================
+  # 3. Sequin Stack (CDC)
   # ==============================================================
   sequin-redis:
     image: redis:7-alpine
     container_name: poc_sequin_redis_cqrs
     ports:
       - "6379:6379"
+    volumes:
+      - sequin_redis_data:/data   # 🛠️ 1. เพิ่ม Volume ให้ Redis จะได้จำคิวได้ตอนรีสตาร์ท
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -77,119 +152,196 @@ services:
       - "7376:7376"
     environment:
       - PORT=7376
-      - PG_HOSTNAME=postgres
+      # 🛠️ 2. เปลี่ยนเป้าหมายให้ยิงตรงเข้า Master Node เท่านั้น
+      - PG_HOSTNAME=postgres-master 
       - PG_PORT=5432
-      - PG_DATABASE=ticketdb
+      # ⚠️ ตรวจสอบชื่อ DB ให้ตรงกับตอนสร้าง Master ด้วยนะครับ (ticketdb หรือ ticket_db)
+      - PG_DATABASE=ticketdb 
       - PG_USERNAME=postgres
-      - PG_PASSWORD=P@ssw0rd1234
+      - PG_PASSWORD=postgres
       - SECRET_KEY_BASE=super_secret_key_base_for_local_ticketing_cqrs_poc_1234567890_abcdef
       - VAULT_KEY=pGOv8qX+L8yQ3j5Vz7rK2b4m9H1nW6xY/C0eA+FvJtE=
       - REDIS_URL=redis://sequin-redis:6379
     depends_on:
-      postgres:
+      postgres-master:          # 🛠️ 3. รอให้ Master ขึ้นมาพร้อมก่อน ค่อยทำงาน
         condition: service_healthy
       sequin-redis:
         condition: service_healthy
 
   # ==============================================================
-  # 4. Backend & Backend-Dapr (.NET 8 API)
+  # NATS Node 1
   # ==============================================================
-  backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    container_name: poc_backend
+  nats-1:
+    image: nats:2.10-alpine
+    container_name: poc_nats_1
     ports:
-      - "5000:8080"
-    environment:
-      - ASPNETCORE_ENVIRONMENT=Development
-      - ASPNETCORE_HTTP_PORTS=8080
-      - DAPR_HTTP_PORT=3500
-      - DAPR_GRPC_PORT=50001
-      - DAPR_HTTP_ENDPOINT=http://127.0.0.1:3500
-      - DAPR_GRPC_ENDPOINT=http://127.0.0.1:50001
-      - TZ=Asia/Bangkok
-    depends_on:
-      postgres:
-        condition: service_healthy
-      nats-setup:
-        condition: service_completed_successfully
-
-  backend-dapr:
-    image: daprio/daprd:latest
-    container_name: poc_backend_dapr
-    command: [
-      "./daprd",
-      "-app-id", "api-service",
-      "-app-port", "8080",
-      "-dapr-http-port", "3500",
-      "-dapr-grpc-port", "50001",
-      "-components-path", "/components"
-    ]
+      - "4231:4222"
+      - "8231:8222"
+    command: >
+      -js 
+      --sd /data
+      --server_name nats-1
+      --cluster_name CQRS-CLUSTER 
+      --cluster nats://0.0.0.0:6222 
+      --routes nats://nats-2:6222,nats://nats-3:6222 
+      -m 8222
     volumes:
-      - ./dapr-components:/components
-    network_mode: "service:backend"
-    depends_on:
-      backend:
-        condition: service_started
-      nats-setup:
-        condition: service_completed_successfully
-      postgres:
-        condition: service_healthy
+      - nats_1_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/varz > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   # ==============================================================
-  # 5. Frontend
+  # NATS Node 2
   # ==============================================================
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    container_name: poc_frontend
+  nats-2:
+    image: nats:2.10-alpine
+    container_name: poc_nats_2
     ports:
-      - "3000:80"
-    environment:
-      - VITE_API_URL=http://localhost:5000
-
-  # ==============================================================
-  # 6. Projection Worker & Worker-Dapr (.NET 8)
-  # ==============================================================
-  projection-worker:
-    build:
-      context: ./worker
-      dockerfile: Dockerfile
-    container_name: poc_projection_worker
-    environment:
-      - ASPNETCORE_ENVIRONMENT=Development
-      - ASPNETCORE_HTTP_PORTS=8080
-      - DAPR_HTTP_PORT=3501
-      - DAPR_GRPC_PORT=50002
-      - DAPR_HTTP_ENDPOINT=http://127.0.0.1:3501
-      - DAPR_GRPC_ENDPOINT=http://127.0.0.1:50002
-      - TZ=Asia/Bangkok
-    depends_on:
-      nats-setup:
-        condition: service_completed_successfully
-
-  worker-dapr:
-    image: daprio/daprd:latest
-    container_name: poc_worker_dapr
-    command: [
-      "./daprd",
-      "-app-id", "projection-worker",
-      "-app-port", "8080",
-      "-dapr-http-port", "3501",
-      "-dapr-grpc-port", "50002",
-      "-components-path", "/components"
-    ]
+      - "4232:4222"
+      - "8232:8222"
+    command: >
+      -js 
+      --sd /data
+      --server_name nats-2
+      --cluster_name CQRS-CLUSTER 
+      --cluster nats://0.0.0.0:6222 
+      --routes nats://nats-1:6222,nats://nats-3:6222 
+      -m 8222
     volumes:
-      - ./dapr-components:/components
-    network_mode: "service:projection-worker"
-    depends_on:
-      projection-worker:
-        condition: service_started
-      nats-setup:
-        condition: service_completed_successfully
+      - nats_2_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/varz > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
+  # ==============================================================
+  # NATS Node 3
+  # ==============================================================
+  nats-3:
+    image: nats:2.10-alpine
+    container_name: poc_nats_3
+    ports:
+      - "4233:4222"
+      - "8233:8222"
+    command: >
+      -js 
+      --sd /data
+      --server_name nats-3
+      --cluster_name CQRS-CLUSTER 
+      --cluster nats://0.0.0.0:6222 
+      --routes nats://nats-1:6222,nats://nats-2:6222 
+      -m 8222
+    volumes:
+      - nats_3_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/varz > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ==============================================================
+  # HAProxy TCP Load Balancer สำหรับ NATS Cluster
+  # ==============================================================
+  haproxy-nats:
+    image: haproxy:2.8-alpine
+    container_name: poc_haproxy_nats
+    ports:
+      - "4222:4222"
+      - "8406:8406"
+    volumes:
+      - ./haproxy-nats.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      nats-1:
+        condition: service_healthy
+      nats-2:
+        condition: service_healthy
+      nats-3:
+        condition: service_healthy
+
+  # ==============================================================
+  # NATS Setup 
+  # ==============================================================
+  nats-setup:
+    image: natsio/nats-box:latest
+    container_name: poc_nats_setup
+    depends_on:
+      nats-1:
+        condition: service_healthy
+      nats-2:
+        condition: service_healthy
+      nats-3:
+        condition: service_healthy
+    command: >
+      sh -c "
+        nats kv add seatKV --replicas 3 --server nats://nats-1:4222 || echo '⚠️  KV Bucket already exists' &&
+        nats stream add SEAT_STREAM --subjects 'seat.events' --discard old --replicas 3 --defaults --server nats://nats-1:4222 || echo '⚠️  Stream already exists' &&
+        echo '✅ NATS Setup Completed!' &&
+        tail -f /dev/null
+      "
+
+  # ==============================================================
+  # WORKER (GO) 
+  # ==============================================================
+  worker-1:
+    build: 
+      context: ./worker  # โฟลเดอร์ที่เก็บ Dockerfile และโค้ด Go
+    container_name: seat_worker-1
+    restart: always
+    environment:
+      - NATS_URL=nats://nats-1:4222,nats://nats-2:4222,nats://nats-3:6222
+    depends_on:
+      nats-1:
+        condition: service_healthy
+      nats-2:
+        condition: service_healthy
+      nats-3:
+        condition: service_healthy
+
+  worker-2:
+    build: 
+      context: ./worker  # โฟลเดอร์ที่เก็บ Dockerfile และโค้ด Go
+    container_name: seat_worker-2
+    restart: always
+    environment:
+      - NATS_URL=nats://nats-1:4222,nats://nats-2:4222,nats://nats-3:6222
+    depends_on:
+      nats-1:
+        condition: service_healthy
+      nats-2:
+        condition: service_healthy
+      nats-3:
+        condition: service_healthy
+
+  worker-3:
+    build: 
+      context: ./worker  # โฟลเดอร์ที่เก็บ Dockerfile และโค้ด Go
+    container_name: seat_worker-3
+    restart: always
+    environment:
+      - NATS_URL=nats://nats-1:4222,nats://nats-2:4222,nats://nats-3:6222
+    depends_on:
+      nats-1:
+        condition: service_healthy
+      nats-2:
+        condition: service_healthy
+      nats-3:
+        condition: service_healthy
+
+# ==============================================================
+# กำหนดจุดเก็บข้อมูลถาวรแยกกันของแต่ละ Node ห้ามใช้ซ้ำกัน
+# ==============================================================
 volumes:
-  nats_data:
-  postgres_data:
+  postgres_master_data:
+  postgres_replica_1_data:
+  postgres_replica_2_data:
+  sequin_redis_data:
+  nats_1_data:
+  nats_2_data:
+  nats_3_data:

@@ -1,21 +1,18 @@
-# 🛠️ Stage 1: Build & Publish
-FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
-WORKDIR /src
-
-# ก๊อปปี้ไฟล์ .csproj เข้าไปก่อนเพื่อ Restore Dependencies (ใช้ Cache ของ Docker ให้เป็นประโยชน์)
-COPY ["TicketProjectionWorker.csproj", "./"]
-RUN dotnet restore "./TicketProjectionWorker.csproj"
-
-# ก๊อปปี้โค้ดทั้งหมด (Program.cs) ตามเข้าไป
-COPY . .
-RUN dotnet publish "TicketProjectionWorker.csproj" -c Release -o /app/publish /p:UseAppHost=false
-
-# 🚀 Stage 2: Production Image (ใช้แค่ Runtime)
-FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS final
+# Stage 1: Build
+FROM golang:1.26-alpine AS builder
+RUN apk add --no-cache git
 WORKDIR /app
 
-# พอร์ตพื้นฐานที่ Minimal API จะรัน (ตรงกับ ASPNETCORE_HTTP_PORTS=8080 ใน docker-compose)
-EXPOSE 8080
+# คัดลอกแค่ไฟล์โค้ด
+COPY main.go ./
 
-COPY --from=build /app/publish .
-ENTRYPOINT ["dotnet", "TicketProjectionWorker.dll"]
+# สร้าง module และ get library โดยไม่บังคับว่าต้องมี go.sum
+RUN go mod init seat-worker && \
+    go get github.com/nats-io/nats.go && \
+    go mod tidy && \
+    CGO_ENABLED=0 GOOS=linux go build -o seat-worker main.go
+
+# Stage 2: Minimal Runtime
+FROM scratch
+COPY --from=builder /app/seat-worker /seat-worker
+ENTRYPOINT ["/seat-worker"]
